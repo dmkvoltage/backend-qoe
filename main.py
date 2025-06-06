@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -176,8 +176,16 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Registration failed")
 
 @app.post("/auth/login", response_model=dict, tags=["Authentication"])
-async def login(user: UserLogin, db: Session = Depends(get_db)):
+async def login(
+    request: Request,
+    user: UserLogin = Body(...),
+    db: Session = Depends(get_db)
+):
     try:
+        # Log the request for debugging
+        content_type = request.headers.get("content-type")
+        logger.info(f"Login request - Content-Type: {content_type}")
+        
         # Authenticate user
         db_user = authenticate_user(db, user.username, user.password)
         if not db_user:
