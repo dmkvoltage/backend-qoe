@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Body, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -8,17 +8,23 @@ import os
 import logging
 from datetime import datetime, timedelta
 import jwt
-from passlib.context import CryptContext
+from typing import List, Dict, Any, Optional
 import json
-from typing import Optional
 
 # Import your modules
 from database import get_db, test_connection, get_connection_info, init_database
 from models import User, NetworkLog, Feedback
-from schemas import UserCreate, UserLogin, NetworkLogCreate, FeedbackCreate
+from schemas import (
+    UserCreate, UserLogin, UserResponse, Token,
+    NetworkLogCreate, NetworkLogResponse,
+    FeedbackCreate, FeedbackResponse,
+    RecommendationResponse
+)
 from crud import (
-    create_user, get_user_by_username, authenticate_user,
-    create_network_log, create_feedback, get_network_logs, get_feedbacks
+    create_user, get_user_by_email, get_user_by_username,
+    create_network_log, create_feedback, get_network_logs, get_feedbacks,
+    get_password_hash, verify_password, authenticate_user,
+    get_provider_recommendations
 )
 
 # Set up logging
@@ -30,28 +36,27 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="QoE App Backend",
-    description="Backend API for Quality of Experience Mobile App",
+    title="QoE App Backend API",
+    description="Backend API for Quality of Experience Mobile App - Network monitoring and feedback collection",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc"
 )
 
-# CORS middleware
+# CORS middleware - Configure properly for production
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Update this with your Flutter app domains
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # Security
-security = HTTPBearer()
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer(auto_error=False)
 
 # JWT settings
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
+SECRET_KEY = os.getenv("SECRET_KEY", "fallback-secret-key-change-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
@@ -62,89 +67,20 @@ async def startup_event():
     init_database()
     logger.info("✅ Application startup complete")
 
-# Utility functions
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
-
-def get_password_hash(password):
-    return pwd_context.hash(password)
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify JWT token and return username"""
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authentication credentials",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        return username
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expired",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication credentials",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-def get_current_user(username: str = Depends(verify_token), db: Session = Depends(get_db)):
-    """Get current user from database"""
-    user = get_user_by_username(db, username=username)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
-    return user
-
-# Helper function to parse request body
-async def parse_body(request: Request):
-    """Parse request body as JSON"""
-    try:
-        body = await request.body()
-        body_str = body.decode('utf-8')
-        return json.loads(body_str)
-    except Exception as e:
-        logger.error(f"Error parsing request body: {e}")
-        raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
-
 # Root endpoint
-@app.get("/")
+@app.get("/", tags=["Root"])
 async def root():
     return {
         "message": "QoE App Backend API",
         "version": "1.0.0",
         "status": "running",
-        "timestamp": datetime.utcnow().isoformat(),
-        "endpoints": {
-            "auth": ["/auth/register", "/auth/login"],
-            "feedback": ["/feedback"],
-            "network-logs": ["/network-logs"],
-            "profile": ["/profile"],
-            "recommendations": ["/recommendations/{location}"],
-            "debug": ["/health", "/debug/echo"]
-        }
+        "docs": "/docs",
+        "health": "/health",
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 # Health check endpoint
-@app.get("/health")
+@app.get("/health", tags=["Health"])
 async def health_check():
     try:
         db_status = test_connection()
@@ -154,11 +90,11 @@ async def health_check():
             "status": "healthy" if db_status else "degraded",
             "database": {
                 "connected": db_status,
-                "type": connection_info.get("database_type", "unknown"),
-                "url_preview": connection_info.get("working_url", "not available")
+                "type": connection_info.get("database_type", "unknown")
             },
             "timestamp": datetime.utcnow().isoformat(),
-            "environment": os.getenv("RENDER_SERVICE_NAME", "local")
+            "environment": os.getenv("RENDER_SERVICE_NAME", "local"),
+            "version": "1.0.0"
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
@@ -171,260 +107,423 @@ async def health_check():
             }
         )
 
-# Debug endpoint
-@app.post("/debug/echo")
-async def echo_request(request: Request):
-    """Echo the request body for debugging"""
+# Utility functions
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+    
     try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return email
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def get_current_user(current_user_email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    user = get_user_by_email(db, current_user_email)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+# Authentication endpoints
+@app.post("/auth/register", tags=["Authentication"])
+async def register(request: Request, db: Session = Depends(get_db)):
+    try:
+        # Log request details for debugging
+        content_type = request.headers.get("content-type", "")
+        logger.info(f"Register request - Content-Type: {content_type}")
+        
+        # Read raw body
         body = await request.body()
         body_str = body.decode('utf-8')
-        headers = dict(request.headers)
+        logger.info(f"Raw request body: {body_str}")
         
-        parsed_json = None
+        # Parse JSON manually
         try:
-            parsed_json = json.loads(body_str)
-        except:
-            parsed_json = "Not valid JSON"
-        
-        return {
-            "raw_body": body_str,
-            "content_type": headers.get("content-type"),
-            "parsed_json": parsed_json,
-            "headers": headers,
-            "method": request.method,
-            "url": str(request.url)
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-# ==================== AUTHENTICATION ENDPOINTS ====================
-
-@app.post("/auth/register")
-async def register(request: Request, db: Session = Depends(get_db)):
-    """Register a new user"""
-    try:
-        data = await parse_body(request)
-        
-        # Validate required fields
-        required_fields = ["username", "email", "password"]
-        for field in required_fields:
-            if field not in data:
-                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
-        
-        # Check if user already exists
-        existing_user = get_user_by_username(db, username=data["username"])
-        if existing_user:
-            raise HTTPException(status_code=400, detail="Username already registered")
-        
-        # Create user
-        user_create = UserCreate(**data)
-        db_user = create_user(db=db, user=user_create)
-        
-        # Create access token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": db_user.username}, expires_delta=access_token_expires
-        )
-        
-        logger.info(f"✅ User registered successfully: {data['username']}")
-        return {
-            "message": "User registered successfully",
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-            "user": {
-                "id": db_user.id,
-                "username": db_user.username,
-                "email": db_user.email,
-                "provider": db_user.provider
+            data = json.loads(body_str)
+            username = data.get("username")
+            email = data.get("email")
+            password = data.get("password")
+            provider = data.get("provider")
+            
+            if not username or not email or not password:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Missing required fields: username, email, password"}
+                )
+            
+            # Check if user already exists
+            if get_user_by_email(db, email):
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Email already registered"}
+                )
+            
+            if get_user_by_username(db, username):
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Username already taken"}
+                )
+            
+            # Hash password and create user
+            hashed_password = get_password_hash(password)
+            user_data = {
+                "username": username,
+                "email": email,
+                "password": hashed_password,
+                "provider": provider
             }
-        }
-    except HTTPException:
-        raise
+            
+            db_user = create_user(db, user_data)
+            
+            # Create access token
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token = create_access_token(
+                data={"sub": db_user.email}, expires_delta=access_token_expires
+            )
+            
+            logger.info(f"✅ User registered successfully: {email}")
+            return JSONResponse(content={
+                "message": "User registered successfully",
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": {
+                    "id": db_user.id,
+                    "email": db_user.email,
+                    "username": db_user.username,
+                    "provider": db_user.provider
+                }
+            })
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid JSON format: {str(e)}"}
+            )
     except Exception as e:
         logger.error(f"❌ Registration failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
-
-@app.post("/auth/login")
-async def login(request: Request, db: Session = Depends(get_db)):
-    """Login user"""
-    try:
-        data = await parse_body(request)
-        
-        # Validate required fields
-        if "username" not in data or "password" not in data:
-            raise HTTPException(status_code=400, detail="Username and password required")
-        
-        # Authenticate user
-        user = authenticate_user(db, data["username"], data["password"])
-        if not user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
-        # Create access token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": user.username}, expires_delta=access_token_expires
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Registration failed: {str(e)}"}
         )
+
+# Raw login endpoint that handles the request manually
+@app.post("/auth/login", tags=["Authentication"])
+async def login(request: Request, db: Session = Depends(get_db)):
+    try:
+        # Log request details for debugging
+        content_type = request.headers.get("content-type", "")
+        logger.info(f"Login request - Content-Type: {content_type}")
         
-        logger.info(f"✅ User logged in successfully: {data['username']}")
-        return {
-            "message": "Login successful",
-            "access_token": access_token,
-            "token_type": "bearer",
-            "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-            "user": {
-                "id": user.id,
-                "username": user.username,
-                "email": user.email,
-                "provider": user.provider
-            }
-        }
-    except HTTPException:
-        raise
+        # Read raw body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        logger.info(f"Raw request body: {body_str}")
+        
+        # Parse JSON manually
+        try:
+            data = json.loads(body_str)
+            username = data.get("username")
+            password = data.get("password")
+            
+            if not username or not password:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Missing username or password"}
+                )
+                
+            # Authenticate user
+            db_user = authenticate_user(db, username, password)
+            if not db_user:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid credentials"}
+                )
+            
+            # Create access token
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token = create_access_token(
+                data={"sub": db_user.email}, expires_delta=access_token_expires
+            )
+            
+            logger.info(f"✅ User logged in successfully: {db_user.email}")
+            return JSONResponse(content={
+                "message": "Login successful",
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": {
+                    "id": db_user.id,
+                    "email": db_user.email,
+                    "username": db_user.username,
+                    "provider": db_user.provider
+                }
+            })
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid JSON format: {str(e)}"}
+            )
     except Exception as e:
         logger.error(f"❌ Login failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Login failed: {str(e)}"}
+        )
 
-# ==================== PROTECTED ENDPOINTS ====================
-
-@app.get("/profile")
-async def get_profile(current_user: User = Depends(get_current_user)):
-    """Get current user profile"""
-    return {
-        "id": current_user.id,
-        "username": current_user.username,
-        "email": current_user.email,
-        "provider": current_user.provider,
-        "created_at": current_user.created_at,
-        "is_active": current_user.is_active
-    }
-
-@app.post("/network-logs")
+# Network logs endpoints
+@app.post("/network-logs", tags=["Network Logs"])
 async def submit_network_log(
     request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Submit a network log"""
     try:
-        data = await parse_body(request)
+        # Read raw body
+        body = await request.body()
+        body_str = body.decode('utf-8')
         
-        # Validate required fields
-        required_fields = ["carrier", "location"]
-        for field in required_fields:
-            if field not in data:
-                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        # Parse JSON manually
+        data = json.loads(body_str)
+        data["user_id"] = current_user.id
         
-        # Create network log
-        log_create = NetworkLogCreate(**data)
-        db_log = create_network_log(db=db, log=log_create, user_id=current_user.id)
+        db_log = create_network_log(db, data)
         
-        logger.info(f"✅ Network log submitted by user: {current_user.username}")
-        return {
+        logger.info(f"✅ Network log submitted by user: {current_user.email}")
+        return JSONResponse(content={
             "message": "Network log submitted successfully",
             "log_id": db_log.id,
-            "timestamp": db_log.timestamp
-        }
-    except HTTPException:
-        raise
+            "timestamp": db_log.timestamp.isoformat()
+        })
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Invalid JSON format: {str(e)}"}
+        )
     except Exception as e:
         logger.error(f"❌ Network log submission failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to submit network log: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to submit network log"}
+        )
 
-@app.get("/network-logs")
+@app.get("/network-logs", tags=["Network Logs"])
 async def get_user_network_logs(
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get user's network logs"""
     try:
-        logs = get_network_logs(db=db, user_id=current_user.id, skip=skip, limit=limit)
-        return {
-            "logs": logs,
-            "count": len(logs),
-            "user": current_user.username
-        }
+        logs = get_network_logs(db, user_id=current_user.id, skip=skip, limit=limit)
+        
+        # Convert to JSON serializable format
+        logs_data = []
+        for log in logs:
+            log_dict = {
+                "id": log.id,
+                "user_id": log.user_id,
+                "carrier": log.carrier,
+                "network_type": log.network_type,
+                "signal_strength": log.signal_strength,
+                "download_speed": log.download_speed,
+                "upload_speed": log.upload_speed,
+                "latency": log.latency,
+                "jitter": log.jitter,
+                "packet_loss": log.packet_loss,
+                "location": log.location,
+                "device_info": log.device_info,
+                "app_version": log.app_version,
+                "timestamp": log.timestamp.isoformat()
+            }
+            logs_data.append(log_dict)
+        
+        return JSONResponse(content=logs_data)
     except Exception as e:
-        logger.error(f"❌ Failed to get network logs: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get network logs: {str(e)}")
+        logger.error(f"❌ Failed to fetch network logs: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to fetch network logs"}
+        )
 
-@app.post("/feedback")
+# Feedback endpoints
+@app.post("/feedback", tags=["Feedback"])
 async def submit_feedback(
     request: Request,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Submit feedback"""
     try:
-        data = await parse_body(request)
+        # Read raw body
+        body = await request.body()
+        body_str = body.decode('utf-8')
         
-        # Validate required fields
-        required_fields = ["overall_satisfaction", "response_time", "usability", "carrier", "location"]
-        for field in required_fields:
-            if field not in data:
-                raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+        # Parse JSON manually
+        data = json.loads(body_str)
+        data["user_id"] = current_user.id
         
-        # Create feedback
-        feedback_create = FeedbackCreate(**data)
-        db_feedback = create_feedback(db=db, feedback=feedback_create, user_id=current_user.id)
+        db_feedback = create_feedback(db, data)
         
-        logger.info(f"✅ Feedback submitted by user: {current_user.username}")
-        return {
+        logger.info(f"✅ Feedback submitted by user: {current_user.email}")
+        return JSONResponse(content={
             "message": "Feedback submitted successfully",
             "feedback_id": db_feedback.id,
-            "timestamp": db_feedback.timestamp
-        }
-    except HTTPException:
-        raise
+            "timestamp": db_feedback.timestamp.isoformat()
+        })
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Invalid JSON format: {str(e)}"}
+        )
     except Exception as e:
         logger.error(f"❌ Feedback submission failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to submit feedback: {str(e)}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to submit feedback"}
+        )
 
-@app.get("/feedback")
+@app.get("/feedback", tags=["Feedback"])
 async def get_user_feedback(
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get user's feedback"""
     try:
-        feedbacks = get_feedbacks(db=db, user_id=current_user.id, skip=skip, limit=limit)
-        return {
-            "feedback": feedbacks,
-            "count": len(feedbacks),
-            "user": current_user.username
-        }
+        feedbacks = get_feedbacks(db, user_id=current_user.id, skip=skip, limit=limit)
+        
+        # Convert to JSON serializable format
+        feedback_data = []
+        for feedback in feedbacks:
+            feedback_dict = {
+                "id": feedback.id,
+                "user_id": feedback.user_id,
+                "overall_satisfaction": feedback.overall_satisfaction,
+                "response_time": feedback.response_time,
+                "usability": feedback.usability,
+                "comments": feedback.comments,
+                "issue_type": feedback.issue_type,
+                "carrier": feedback.carrier,
+                "network_type": feedback.network_type,
+                "location": feedback.location,
+                "signal_strength": feedback.signal_strength,
+                "download_speed": feedback.download_speed,
+                "upload_speed": feedback.upload_speed,
+                "latency": feedback.latency,
+                "timestamp": feedback.timestamp.isoformat()
+            }
+            feedback_data.append(feedback_dict)
+        
+        return JSONResponse(content=feedback_data)
     except Exception as e:
-        logger.error(f"❌ Failed to get feedback: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get feedback: {str(e)}")
+        logger.error(f"❌ Failed to fetch feedback: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to fetch feedback"}
+        )
 
-@app.get("/recommendations/{location}")
+# Recommendations endpoint
+@app.get("/recommendations/{location}", tags=["Recommendations"])
 async def get_recommendations(
     location: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Get provider recommendations for a location"""
     try:
-        from crud import get_provider_recommendations
-        recommendations = get_provider_recommendations(db=db, location=location)
+        recommendations = get_provider_recommendations(db, location)
+        logger.info(f"✅ Recommendations fetched for location: {location}")
+        return JSONResponse(content=recommendations)
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch recommendations: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to fetch recommendations"}
+        )
+
+# User profile endpoint
+@app.get("/profile", tags=["User"])
+async def get_profile(current_user: User = Depends(get_current_user)):
+    return JSONResponse(content={
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "provider": current_user.provider,
+        "created_at": current_user.created_at.isoformat(),
+        "is_active": current_user.is_active
+    })
+
+# Debug endpoint to echo request details
+@app.post("/debug/echo", tags=["Debug"])
+async def debug_echo(request: Request):
+    try:
+        # Get headers
+        headers = dict(request.headers.items())
         
+        # Get body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        
+        # Try to parse as JSON
+        try:
+            body_json = json.loads(body_str)
+        except:
+            body_json = None
+            
         return {
-            "location": location,
-            "recommendations": recommendations,
-            "count": len(recommendations),
-            "user": current_user.username
+            "method": request.method,
+            "url": str(request.url),
+            "headers": headers,
+            "raw_body": body_str,
+            "parsed_body": body_json,
+            "content_type": headers.get("content-type", ""),
+            "timestamp": datetime.utcnow().isoformat()
         }
     except Exception as e:
-        logger.error(f"❌ Failed to get recommendations: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get recommendations: {str(e)}")
+        return {"error": str(e)}
+
+# Debug endpoints (remove in production)
+@app.get("/debug/database", tags=["Debug"])
+async def debug_database():
+    try:
+        connection_info = get_connection_info()
+        return {
+            "database_info": connection_info,
+            "environment_vars": {
+                "DATABASE_URL": "***" if os.getenv("DATABASE_URL") else None,
+                "SUPABASE_DATABASE_URL": "***" if os.getenv("SUPABASE_DATABASE_URL") else None,
+                "RENDER_SERVICE_NAME": os.getenv("RENDER_SERVICE_NAME"),
+                "SECRET_KEY": "***" if os.getenv("SECRET_KEY") else "using fallback"
+            }
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/debug/test-query", tags=["Debug"])
+async def debug_test_query(db: Session = Depends(get_db)):
+    try:
+        result = db.execute(text("SELECT current_timestamp, version()"))
+        row = result.fetchone()
+        return {
+            "timestamp": str(row[0]) if row else None,
+            "database_version": str(row[1]) if row else None,
+            "status": "success"
+        }
+    except Exception as e:
+        return {"error": str(e), "status": "failed"}
 
 # Error handlers
 @app.exception_handler(404)
