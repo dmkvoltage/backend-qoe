@@ -8,7 +8,7 @@ import os
 import logging
 from datetime import datetime, timedelta
 import jwt
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import json
 
 # Import your modules
@@ -53,7 +53,7 @@ app.add_middleware(
 )
 
 # Security
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 # JWT settings
 SECRET_KEY = os.getenv("SECRET_KEY", "fallback-secret-key-change-in-production")
@@ -118,13 +118,18 @@ def create_access_token(data: dict, expires_delta: timedelta = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+    
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
         if email is None:
             raise HTTPException(status_code=401, detail="Invalid token")
         return email
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
@@ -135,46 +140,86 @@ def get_current_user(current_user_email: str = Depends(verify_token), db: Sessio
     return user
 
 # Authentication endpoints
-@app.post("/auth/register", response_model=dict, tags=["Authentication"])
-async def register(user: UserCreate, db: Session = Depends(get_db)):
+@app.post("/auth/register", tags=["Authentication"])
+async def register(request: Request, db: Session = Depends(get_db)):
     try:
-        # Check if user already exists
-        if get_user_by_email(db, user.email):
-            raise HTTPException(status_code=400, detail="Email already registered")
+        # Log request details for debugging
+        content_type = request.headers.get("content-type", "")
+        logger.info(f"Register request - Content-Type: {content_type}")
         
-        if get_user_by_username(db, user.username):
-            raise HTTPException(status_code=400, detail="Username already taken")
+        # Read raw body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        logger.info(f"Raw request body: {body_str}")
         
-        # Hash password and create user
-        hashed_password = get_password_hash(user.password)
-        user_data = user.dict()
-        user_data["password"] = hashed_password
-        
-        db_user = create_user(db, user_data)
-        
-        # Create access token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": db_user.email}, expires_delta=access_token_expires
-        )
-        
-        logger.info(f"✅ User registered successfully: {user.email}")
-        return {
-            "message": "User registered successfully",
-            "access_token": access_token,
-            "token_type": "bearer",
-            "user": {
-                "id": db_user.id,
-                "email": db_user.email,
-                "username": db_user.username,
-                "provider": db_user.provider
+        # Parse JSON manually
+        try:
+            data = json.loads(body_str)
+            username = data.get("username")
+            email = data.get("email")
+            password = data.get("password")
+            provider = data.get("provider")
+            
+            if not username or not email or not password:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Missing required fields: username, email, password"}
+                )
+            
+            # Check if user already exists
+            if get_user_by_email(db, email):
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Email already registered"}
+                )
+            
+            if get_user_by_username(db, username):
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Username already taken"}
+                )
+            
+            # Hash password and create user
+            hashed_password = get_password_hash(password)
+            user_data = {
+                "username": username,
+                "email": email,
+                "password": hashed_password,
+                "provider": provider
             }
-        }
-    except HTTPException:
-        raise
+            
+            db_user = create_user(db, user_data)
+            
+            # Create access token
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token = create_access_token(
+                data={"sub": db_user.email}, expires_delta=access_token_expires
+            )
+            
+            logger.info(f"✅ User registered successfully: {email}")
+            return JSONResponse(content={
+                "message": "User registered successfully",
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": {
+                    "id": db_user.id,
+                    "email": db_user.email,
+                    "username": db_user.username,
+                    "provider": db_user.provider
+                }
+            })
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid JSON format: {str(e)}"}
+            )
     except Exception as e:
         logger.error(f"❌ Registration failed: {e}")
-        raise HTTPException(status_code=500, detail="Registration failed")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Registration failed: {str(e)}"}
+        )
 
 # Raw login endpoint that handles the request manually
 @app.post("/auth/login", tags=["Authentication"])
@@ -240,6 +285,187 @@ async def login(request: Request, db: Session = Depends(get_db)):
             content={"detail": f"Login failed: {str(e)}"}
         )
 
+# Network logs endpoints
+@app.post("/network-logs", tags=["Network Logs"])
+async def submit_network_log(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        # Read raw body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        
+        # Parse JSON manually
+        data = json.loads(body_str)
+        data["user_id"] = current_user.id
+        
+        db_log = create_network_log(db, data)
+        
+        logger.info(f"✅ Network log submitted by user: {current_user.email}")
+        return JSONResponse(content={
+            "message": "Network log submitted successfully",
+            "log_id": db_log.id,
+            "timestamp": db_log.timestamp.isoformat()
+        })
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Invalid JSON format: {str(e)}"}
+        )
+    except Exception as e:
+        logger.error(f"❌ Network log submission failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to submit network log"}
+        )
+
+@app.get("/network-logs", tags=["Network Logs"])
+async def get_user_network_logs(
+    skip: int = 0,
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        logs = get_network_logs(db, user_id=current_user.id, skip=skip, limit=limit)
+        
+        # Convert to JSON serializable format
+        logs_data = []
+        for log in logs:
+            log_dict = {
+                "id": log.id,
+                "user_id": log.user_id,
+                "carrier": log.carrier,
+                "network_type": log.network_type,
+                "signal_strength": log.signal_strength,
+                "download_speed": log.download_speed,
+                "upload_speed": log.upload_speed,
+                "latency": log.latency,
+                "jitter": log.jitter,
+                "packet_loss": log.packet_loss,
+                "location": log.location,
+                "device_info": log.device_info,
+                "app_version": log.app_version,
+                "timestamp": log.timestamp.isoformat()
+            }
+            logs_data.append(log_dict)
+        
+        return JSONResponse(content=logs_data)
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch network logs: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to fetch network logs"}
+        )
+
+# Feedback endpoints
+@app.post("/feedback", tags=["Feedback"])
+async def submit_feedback(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        # Read raw body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        
+        # Parse JSON manually
+        data = json.loads(body_str)
+        data["user_id"] = current_user.id
+        
+        db_feedback = create_feedback(db, data)
+        
+        logger.info(f"✅ Feedback submitted by user: {current_user.email}")
+        return JSONResponse(content={
+            "message": "Feedback submitted successfully",
+            "feedback_id": db_feedback.id,
+            "timestamp": db_feedback.timestamp.isoformat()
+        })
+    except json.JSONDecodeError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Invalid JSON format: {str(e)}"}
+        )
+    except Exception as e:
+        logger.error(f"❌ Feedback submission failed: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to submit feedback"}
+        )
+
+@app.get("/feedback", tags=["Feedback"])
+async def get_user_feedback(
+    skip: int = 0,
+    limit: int = 100,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        feedbacks = get_feedbacks(db, user_id=current_user.id, skip=skip, limit=limit)
+        
+        # Convert to JSON serializable format
+        feedback_data = []
+        for feedback in feedbacks:
+            feedback_dict = {
+                "id": feedback.id,
+                "user_id": feedback.user_id,
+                "overall_satisfaction": feedback.overall_satisfaction,
+                "response_time": feedback.response_time,
+                "usability": feedback.usability,
+                "comments": feedback.comments,
+                "issue_type": feedback.issue_type,
+                "carrier": feedback.carrier,
+                "network_type": feedback.network_type,
+                "location": feedback.location,
+                "signal_strength": feedback.signal_strength,
+                "download_speed": feedback.download_speed,
+                "upload_speed": feedback.upload_speed,
+                "latency": feedback.latency,
+                "timestamp": feedback.timestamp.isoformat()
+            }
+            feedback_data.append(feedback_dict)
+        
+        return JSONResponse(content=feedback_data)
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch feedback: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to fetch feedback"}
+        )
+
+# Recommendations endpoint
+@app.get("/recommendations/{location}", tags=["Recommendations"])
+async def get_recommendations(
+    location: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        recommendations = get_provider_recommendations(db, location)
+        logger.info(f"✅ Recommendations fetched for location: {location}")
+        return JSONResponse(content=recommendations)
+    except Exception as e:
+        logger.error(f"❌ Failed to fetch recommendations: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Failed to fetch recommendations"}
+        )
+
+# User profile endpoint
+@app.get("/profile", tags=["User"])
+async def get_profile(current_user: User = Depends(get_current_user)):
+    return JSONResponse(content={
+        "id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "provider": current_user.provider,
+        "created_at": current_user.created_at.isoformat(),
+        "is_active": current_user.is_active
+    })
+
 # Debug endpoint to echo request details
 @app.post("/debug/echo", tags=["Debug"])
 async def debug_echo(request: Request):
@@ -268,100 +494,6 @@ async def debug_echo(request: Request):
         }
     except Exception as e:
         return {"error": str(e)}
-
-# Network logs endpoints
-@app.post("/network-logs", response_model=dict, tags=["Network Logs"])
-async def submit_network_log(
-    log: NetworkLogCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        log_data = log.dict()
-        log_data["user_id"] = current_user.id
-        
-        db_log = create_network_log(db, log_data)
-        
-        logger.info(f"✅ Network log submitted by user: {current_user.email}")
-        return {
-            "message": "Network log submitted successfully",
-            "log_id": db_log.id,
-            "timestamp": db_log.timestamp
-        }
-    except Exception as e:
-        logger.error(f"❌ Network log submission failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit network log")
-
-@app.get("/network-logs", response_model=List[NetworkLogResponse], tags=["Network Logs"])
-async def get_user_network_logs(
-    skip: int = 0,
-    limit: int = 100,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        logs = get_network_logs(db, user_id=current_user.id, skip=skip, limit=limit)
-        return logs
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch network logs: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch network logs")
-
-# Feedback endpoints
-@app.post("/feedback", response_model=dict, tags=["Feedback"])
-async def submit_feedback(
-    feedback: FeedbackCreate,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        feedback_data = feedback.dict()
-        feedback_data["user_id"] = current_user.id
-        
-        db_feedback = create_feedback(db, feedback_data)
-        
-        logger.info(f"✅ Feedback submitted by user: {current_user.email}")
-        return {
-            "message": "Feedback submitted successfully",
-            "feedback_id": db_feedback.id,
-            "timestamp": db_feedback.timestamp
-        }
-    except Exception as e:
-        logger.error(f"❌ Feedback submission failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to submit feedback")
-
-@app.get("/feedback", response_model=List[FeedbackResponse], tags=["Feedback"])
-async def get_user_feedback(
-    skip: int = 0,
-    limit: int = 100,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        feedbacks = get_feedbacks(db, user_id=current_user.id, skip=skip, limit=limit)
-        return feedbacks
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch feedback: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch feedback")
-
-# Recommendations endpoint
-@app.get("/recommendations/{location}", response_model=List[RecommendationResponse], tags=["Recommendations"])
-async def get_recommendations(
-    location: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    try:
-        recommendations = get_provider_recommendations(db, location)
-        logger.info(f"✅ Recommendations fetched for location: {location}")
-        return recommendations
-    except Exception as e:
-        logger.error(f"❌ Failed to fetch recommendations: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch recommendations")
-
-# User profile endpoint
-@app.get("/profile", response_model=UserResponse, tags=["User"])
-async def get_profile(current_user: User = Depends(get_current_user)):
-    return current_user
 
 # Debug endpoints (remove in production)
 @app.get("/debug/database", tags=["Debug"])
