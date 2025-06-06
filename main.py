@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, Request, Body
+from fastapi import FastAPI, HTTPException, Depends, status, Request, Body, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -8,7 +8,8 @@ import os
 import logging
 from datetime import datetime, timedelta
 import jwt
-from typing import List
+from typing import List, Dict, Any
+import json
 
 # Import your modules
 from database import get_db, test_connection, get_connection_info, init_database
@@ -47,7 +48,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Update this with your Flutter app domains
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -175,45 +176,98 @@ async def register(user: UserCreate, db: Session = Depends(get_db)):
         logger.error(f"❌ Registration failed: {e}")
         raise HTTPException(status_code=500, detail="Registration failed")
 
-@app.post("/auth/login", response_model=dict, tags=["Authentication"])
-async def login(
-    request: Request,
-    user: UserLogin = Body(...),
-    db: Session = Depends(get_db)
-):
+# Raw login endpoint that handles the request manually
+@app.post("/auth/login", tags=["Authentication"])
+async def login(request: Request, db: Session = Depends(get_db)):
     try:
-        # Log the request for debugging
-        content_type = request.headers.get("content-type")
+        # Log request details for debugging
+        content_type = request.headers.get("content-type", "")
         logger.info(f"Login request - Content-Type: {content_type}")
         
-        # Authenticate user
-        db_user = authenticate_user(db, user.username, user.password)
-        if not db_user:
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+        # Read raw body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        logger.info(f"Raw request body: {body_str}")
         
-        # Create access token
-        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-        access_token = create_access_token(
-            data={"sub": db_user.email}, expires_delta=access_token_expires
-        )
-        
-        logger.info(f"✅ User logged in successfully: {db_user.email}")
-        return {
-            "message": "Login successful",
-            "access_token": access_token,
-            "token_type": "bearer",
-            "user": {
-                "id": db_user.id,
-                "email": db_user.email,
-                "username": db_user.username,
-                "provider": db_user.provider
-            }
-        }
-    except HTTPException:
-        raise
+        # Parse JSON manually
+        try:
+            data = json.loads(body_str)
+            username = data.get("username")
+            password = data.get("password")
+            
+            if not username or not password:
+                return JSONResponse(
+                    status_code=400,
+                    content={"detail": "Missing username or password"}
+                )
+                
+            # Authenticate user
+            db_user = authenticate_user(db, username, password)
+            if not db_user:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Invalid credentials"}
+                )
+            
+            # Create access token
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            access_token = create_access_token(
+                data={"sub": db_user.email}, expires_delta=access_token_expires
+            )
+            
+            logger.info(f"✅ User logged in successfully: {db_user.email}")
+            return JSONResponse(content={
+                "message": "Login successful",
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": {
+                    "id": db_user.id,
+                    "email": db_user.email,
+                    "username": db_user.username,
+                    "provider": db_user.provider
+                }
+            })
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            return JSONResponse(
+                status_code=400,
+                content={"detail": f"Invalid JSON format: {str(e)}"}
+            )
     except Exception as e:
         logger.error(f"❌ Login failed: {e}")
-        raise HTTPException(status_code=500, detail="Login failed")
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Login failed: {str(e)}"}
+        )
+
+# Debug endpoint to echo request details
+@app.post("/debug/echo", tags=["Debug"])
+async def debug_echo(request: Request):
+    try:
+        # Get headers
+        headers = dict(request.headers.items())
+        
+        # Get body
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        
+        # Try to parse as JSON
+        try:
+            body_json = json.loads(body_str)
+        except:
+            body_json = None
+            
+        return {
+            "method": request.method,
+            "url": str(request.url),
+            "headers": headers,
+            "raw_body": body_str,
+            "parsed_body": body_json,
+            "content_type": headers.get("content-type", ""),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 # Network logs endpoints
 @app.post("/network-logs", response_model=dict, tags=["Network Logs"])
