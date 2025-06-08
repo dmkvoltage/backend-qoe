@@ -376,26 +376,7 @@ async def submit_feedback(
         data = json.loads(body_str)
         data["user_id"] = current_user.id
         
-        # Ensure all fields are properly handled, including NULL values
-        feedback_data = {
-            "user_id": current_user.id,
-            "overall_satisfaction": data.get("overall_satisfaction"),
-            "response_time": data.get("response_time"),
-            "usability": data.get("usability"),
-            "comments": data.get("comments"),
-            "issue_type": data.get("issue_type"),  # This was missing
-            "carrier": data.get("carrier", "Unknown"),
-            "network_type": data.get("network_type"),  # This was missing
-            "location": data.get("location", "Unknown"),
-            "signal_strength": data.get("signal_strength"),  # This was missing
-            "download_speed": data.get("download_speed"),  # This was missing
-            "upload_speed": data.get("upload_speed"),  # This was missing
-            "latency": data.get("latency"),  # This was missing
-        }
-        
-        logger.info(f"📝 Feedback data received: {feedback_data}")
-        
-        db_feedback = create_feedback(db, feedback_data)
+        db_feedback = create_feedback(db, data)
         
         logger.info(f"✅ Feedback submitted by user: {current_user.email}")
         return JSONResponse(content={
