@@ -139,6 +139,106 @@ def get_password_hash(password):
         # Simple storage for fallback (not secure, just for testing)
         return password
 
+# Database checker functions integrated into FastAPI
+def check_environment_variables():
+    """Check if all required environment variables are set"""
+    env_vars = [
+        "SUPABASE_DATABASE_URL",
+        "DATABASE_URL",
+        "SECRET_KEY"
+    ]
+    
+    found_vars = {}
+    for var in env_vars:
+        value = os.getenv(var)
+        if value:
+            # Mask sensitive parts of the URL
+            if "postgresql://" in value:
+                masked = value[:20] + "***" + value[-20:] if len(value) > 40 else "***"
+                found_vars[var] = masked
+            else:
+                found_vars[var] = value[:10] + "***" if len(value) > 10 else "***"
+        else:
+            found_vars[var] = "❌ NOT SET"
+    
+    return found_vars
+
+def test_direct_connection():
+    """Test direct connection using psycopg2"""
+    try:
+        import psycopg2
+        
+        # Your confirmed connection details
+        connection_params = {
+            "host": "aws-0-sa-east-1.pooler.supabase.com",
+            "port": 6543,
+            "database": "postgres",
+            "user": "postgres.tlcbimopgpcaxgehncey",
+            "password": "08200108dyekrane"
+        }
+        
+        conn = psycopg2.connect(**connection_params)
+        cursor = conn.cursor()
+        
+        # Test basic query
+        cursor.execute("SELECT version();")
+        version = cursor.fetchone()[0]
+        
+        # Test permissions
+        cursor.execute("SELECT current_user, current_database();")
+        user, db = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "success": True,
+            "version": version,
+            "current_user": user,
+            "current_database": db
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def check_tables_info():
+    """Check table information"""
+    try:
+        if not DATABASE_AVAILABLE:
+            return {"error": "Database not available"}
+            
+        inspector = inspect(engine)
+        existing_tables = inspector.get_table_names()
+        
+        table_info = {
+            "tables": existing_tables,
+            "table_counts": {},
+            "required_tables": ["users", "feedback", "network_logs"],
+            "missing_tables": []
+        }
+        
+        # Check for required tables
+        required_tables = ["users", "feedback", "network_logs"]
+        table_info["missing_tables"] = [table for table in required_tables if table not in existing_tables]
+        
+        # Get row counts
+        with engine.connect() as conn:
+            for table in existing_tables:
+                try:
+                    result = conn.execute(text(f"SELECT COUNT(*) FROM {table}"))
+                    count = result.fetchone()[0]
+                    table_info["table_counts"][table] = count
+                except Exception as e:
+                    table_info["table_counts"][table] = f"Error: {str(e)}"
+        
+        return table_info
+        
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.get("/")
 async def root():
     return {
@@ -151,9 +251,163 @@ async def root():
             "auth": ["/auth/register", "/auth/login"],
             "feedback": ["/feedback"],
             "network-logs": ["/network-logs"],
-            "debug": ["/health", "/debug/routes", "/debug/echo"]
+            "debug": ["/health", "/debug/routes", "/debug/echo", "/debug/database", "/debug/database-check"]
         }
     }
+
+@app.get("/debug/database-check")
+async def comprehensive_database_check():
+    """Comprehensive database connection and health check"""
+    try:
+        check_result = {
+            "timestamp": datetime.utcnow(),
+            "environment_variables": check_environment_variables(),
+            "direct_connection": test_direct_connection(),
+            "database_available": DATABASE_AVAILABLE,
+            "sqlalchemy_connection": False,
+            "tables_info": {},
+            "recent_data": {},
+            "test_operations": {},
+            "summary": {}
+        }
+        
+        # Test SQLAlchemy connection
+        if DATABASE_AVAILABLE:
+            try:
+                with engine.connect() as conn:
+                    result = conn.execute(text("SELECT 1 as test"))
+                    test_value = result.fetchone()[0]
+                    check_result["sqlalchemy_connection"] = True
+                    
+                    # Get database info
+                    result = conn.execute(text("SELECT current_database(), current_user, version()"))
+                    db_name, user, version = result.fetchone()
+                    check_result["database_info"] = {
+                        "database": db_name,
+                        "user": user,
+                        "version": version[:100] + "..." if len(version) > 100 else version
+                    }
+                    
+            except Exception as e:
+                check_result["sqlalchemy_error"] = str(e)
+        
+        # Get table information
+        check_result["tables_info"] = check_tables_info()
+        
+        # Get recent data samples
+        if DATABASE_AVAILABLE and check_result["sqlalchemy_connection"]:
+            try:
+                with engine.connect() as conn:
+                    # Check network_logs
+                    try:
+                        result = conn.execute(text(
+                            "SELECT id, carrier, network_type, download_speed, timestamp "
+                            "FROM network_logs ORDER BY timestamp DESC LIMIT 5"
+                        ))
+                        check_result["recent_data"]["network_logs"] = [
+                            {
+                                "id": row[0],
+                                "carrier": row[1],
+                                "network_type": row[2],
+                                "download_speed": float(row[3]) if row[3] else 0,
+                                "timestamp": row[4].isoformat() if row[4] else None
+                            }
+                            for row in result.fetchall()
+                        ]
+                    except Exception as e:
+                        check_result["recent_data"]["network_logs_error"] = str(e)
+                    
+                    # Check feedback
+                    try:
+                        result = conn.execute(text(
+                            "SELECT id, overall_satisfaction, comments, timestamp "
+                            "FROM feedback ORDER BY timestamp DESC LIMIT 5"
+                        ))
+                        check_result["recent_data"]["feedback"] = [
+                            {
+                                "id": row[0],
+                                "overall_satisfaction": row[1],
+                                "comments": row[2],
+                                "timestamp": row[3].isoformat() if row[3] else None
+                            }
+                            for row in result.fetchall()
+                        ]
+                    except Exception as e:
+                        check_result["recent_data"]["feedback_error"] = str(e)
+                        
+                    # Test data operations
+                    try:
+                        # Test INSERT
+                        insert_query = text("""
+                            INSERT INTO network_logs (
+                                user_id, carrier, network_type, signal_strength, 
+                                download_speed, upload_speed, latency, location
+                            ) VALUES (
+                                1, 'TEST_CHECKER', 'TEST_TYPE', -50, 
+                                10.5, 5.2, 20, 'TEST_LOCATION'
+                            ) RETURNING id
+                        """)
+                        
+                        result = conn.execute(insert_query)
+                        new_id = result.fetchone()[0]
+                        
+                        # Test SELECT
+                        select_query = text("SELECT * FROM network_logs WHERE id = :id")
+                        result = conn.execute(select_query, {"id": new_id})
+                        record = result.fetchone()
+                        
+                        # Test DELETE (cleanup)
+                        delete_query = text("DELETE FROM network_logs WHERE id = :id")
+                        conn.execute(delete_query, {"id": new_id})
+                        conn.commit()
+                        
+                        check_result["test_operations"] = {
+                            "insert": "✅ SUCCESS",
+                            "select": "✅ SUCCESS",
+                            "delete": "✅ SUCCESS",
+                            "test_record_id": new_id
+                        }
+                        
+                    except Exception as e:
+                        check_result["test_operations"] = {
+                            "error": str(e),
+                            "status": "❌ FAILED"
+                        }
+                        
+            except Exception as e:
+                check_result["data_operations_error"] = str(e)
+        
+        # Generate summary
+        summary = {
+            "overall_status": "🎉 FULLY FUNCTIONAL",
+            "issues": []
+        }
+        
+        if not check_result["direct_connection"]["success"]:
+            summary["issues"].append("Direct connection failed")
+            summary["overall_status"] = "❌ CONNECTION ISSUES"
+        
+        if not check_result["sqlalchemy_connection"]:
+            summary["issues"].append("SQLAlchemy connection failed")
+            summary["overall_status"] = "❌ CONNECTION ISSUES"
+        
+        if check_result["tables_info"].get("missing_tables"):
+            summary["issues"].append(f"Missing tables: {check_result['tables_info']['missing_tables']}")
+            summary["overall_status"] = "⚠️ MISSING TABLES"
+        
+        if check_result["test_operations"].get("error"):
+            summary["issues"].append("Data operations failed")
+            summary["overall_status"] = "⚠️ OPERATION ISSUES"
+        
+        check_result["summary"] = summary
+        
+        return check_result
+        
+    except Exception as e:
+        return {
+            "error": f"Database check failed: {str(e)}",
+            "timestamp": datetime.utcnow()
+        }
 
 @app.get("/health")
 async def health_check():
@@ -177,6 +431,98 @@ async def health_check():
             "status": "degraded",
             "database": "error",
             "error": str(e),
+            "timestamp": datetime.utcnow()
+        }
+
+@app.get("/debug/database")
+async def debug_database():
+    """Comprehensive database debug information"""
+    try:
+        debug_info = {
+            "timestamp": datetime.utcnow(),
+            "database_available": DATABASE_AVAILABLE,
+            "connection_test": False,
+            "tables": [],
+            "table_counts": {},
+            "recent_data": {},
+            "errors": []
+        }
+        
+        if DATABASE_AVAILABLE:
+            try:
+                # Test connection
+                with engine.connect() as conn:
+                    conn.execute(text("SELECT 1"))
+                    debug_info["connection_test"] = True
+                    
+                    # Get table information
+                    inspector = inspect(engine)
+                    debug_info["tables"] = inspector.get_table_names()
+                    
+                    # Get row counts for each table
+                    for table in debug_info["tables"]:
+                        try:
+                            result = conn.execute(text(f"SELECT COUNT(*) FROM {table}"))
+                            count = result.fetchone()[0]
+                            debug_info["table_counts"][table] = count
+                        except Exception as e:
+                            debug_info["table_counts"][table] = f"Error: {str(e)}"
+                    
+                    # Get recent data samples
+                    if "network_logs" in debug_info["tables"]:
+                        try:
+                            result = conn.execute(text(
+                                "SELECT id, carrier, network_type, download_speed, timestamp "
+                                "FROM network_logs ORDER BY timestamp DESC LIMIT 5"
+                            ))
+                            debug_info["recent_data"]["network_logs"] = [
+                                {
+                                    "id": row[0],
+                                    "carrier": row[1],
+                                    "network_type": row[2],
+                                    "download_speed": float(row[3]) if row[3] else 0,
+                                    "timestamp": row[4].isoformat() if row[4] else None
+                                }
+                                for row in result.fetchall()
+                            ]
+                        except Exception as e:
+                            debug_info["errors"].append(f"Error fetching network_logs: {str(e)}")
+                    
+                    if "feedback" in debug_info["tables"]:
+                        try:
+                            result = conn.execute(text(
+                                "SELECT id, overall_satisfaction, comments, timestamp "
+                                "FROM feedback ORDER BY timestamp DESC LIMIT 5"
+                            ))
+                            debug_info["recent_data"]["feedback"] = [
+                                {
+                                    "id": row[0],
+                                    "overall_satisfaction": row[1],
+                                    "comments": row[2],
+                                    "timestamp": row[3].isoformat() if row[3] else None
+                                }
+                                for row in result.fetchall()
+                            ]
+                        except Exception as e:
+                            debug_info["errors"].append(f"Error fetching feedback: {str(e)}")
+                            
+            except Exception as e:
+                debug_info["errors"].append(f"Database connection error: {str(e)}")
+        else:
+            debug_info["errors"].append("Database not available - using in-memory storage")
+            debug_info["memory_data"] = {
+                "users": len(users_memory),
+                "feedback": len(feedback_memory),
+                "logs": len(logs_memory),
+                "recent_feedback": feedback_memory[-5:] if feedback_memory else [],
+                "recent_logs": logs_memory[-5:] if logs_memory else []
+            }
+        
+        return debug_info
+        
+    except Exception as e:
+        return {
+            "error": f"Debug endpoint error: {str(e)}",
             "timestamp": datetime.utcnow()
         }
 
@@ -319,22 +665,68 @@ async def echo_request(request: Request):
     except Exception as e:
         return {"error": str(e)}
 
-# REMOVED AUTHENTICATION REQUIREMENT - Now accepts anonymous submissions
+# FIXED - Now saves to database when available
 @app.post("/feedback")
 async def submit_feedback(request: Request):
     try:
         data = await parse_body(request)
+        
+        # Try to save to database first
+        if DATABASE_AVAILABLE:
+            try:
+                db = next(get_db())
+                
+                # Create feedback object for database
+                feedback_data = {
+                    "overall_satisfaction": data.get("overall_satisfaction", 3),
+                    "response_time": data.get("response_time", 3),
+                    "usability": data.get("usability", 3),
+                    "comments": data.get("comments", ""),
+                    "issue_type": data.get("issue_type", "general"),
+                    "carrier": data.get("carrier", "Unknown"),
+                    "network_type": data.get("network_type", "Unknown"),
+                    "location": data.get("location", "Unknown"),
+                    "signal_strength": data.get("signal_strength", -100),
+                    "download_speed": data.get("download_speed", 0.0),
+                    "upload_speed": data.get("upload_speed", 0.0),
+                    "latency": data.get("latency", 999),
+                }
+                
+                # Create feedback in database (without user_id for anonymous)
+                db_feedback = Feedback(
+                    user_id=1,  # Use anonymous user ID
+                    **feedback_data
+                )
+                db.add(db_feedback)
+                db.commit()
+                db.refresh(db_feedback)
+                db.close()
+                
+                print(f"✅ Feedback saved to database: {db_feedback.id}")
+                return {
+                    "id": db_feedback.id,
+                    "timestamp": db_feedback.timestamp,
+                    "storage": "database",
+                    **feedback_data
+                }
+                
+            except Exception as db_error:
+                print(f"Database error, falling back to memory: {db_error}")
+                # Fall through to memory storage
+        
+        # Fallback to in-memory storage
         feedback_id = len(feedback_memory) + 1
         feedback = {
             "id": feedback_id,
             "timestamp": datetime.utcnow(),
             "storage": "memory",
-            "anonymous": True,  # Mark as anonymous submission
+            "anonymous": True,
             **data
         }
         feedback_memory.append(feedback)
-        print(f"✅ Anonymous feedback submitted: {feedback_id}")
+        print(f"✅ Anonymous feedback submitted to memory: {feedback_id}")
         return feedback
+        
     except Exception as e:
         print(f"Feedback error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to submit feedback: {str(e)}")
@@ -343,22 +735,67 @@ async def submit_feedback(request: Request):
 async def get_user_feedback():
     return feedback_memory
 
-# REMOVED AUTHENTICATION REQUIREMENT - Now accepts anonymous submissions
+# FIXED - Now saves to database when available
 @app.post("/network-logs")
 async def submit_network_log(request: Request):
     try:
         data = await parse_body(request)
+        
+        # Try to save to database first
+        if DATABASE_AVAILABLE:
+            try:
+                db = next(get_db())
+                
+                # Create network log object for database
+                log_data = {
+                    "carrier": data.get("carrier", "Unknown"),
+                    "network_type": data.get("network_type", "Unknown"),
+                    "signal_strength": data.get("signal_strength", -100),
+                    "download_speed": data.get("download_speed", 0.0),
+                    "upload_speed": data.get("upload_speed", 0.0),
+                    "latency": data.get("latency", 999),
+                    "jitter": data.get("jitter", 0.0),
+                    "packet_loss": data.get("packet_loss", 0.0),
+                    "location": data.get("location", "Unknown"),
+                    "device_info": data.get("device_info", "Unknown"),
+                    "app_version": data.get("app_version", "1.0.0"),
+                }
+                
+                # Create network log in database (without user_id for anonymous)
+                db_log = NetworkLog(
+                    user_id=1,  # Use anonymous user ID
+                    **log_data
+                )
+                db.add(db_log)
+                db.commit()
+                db.refresh(db_log)
+                db.close()
+                
+                print(f"✅ Network log saved to database: {db_log.id}")
+                return {
+                    "id": db_log.id,
+                    "timestamp": db_log.timestamp,
+                    "storage": "database",
+                    **log_data
+                }
+                
+            except Exception as db_error:
+                print(f"Database error, falling back to memory: {db_error}")
+                # Fall through to memory storage
+        
+        # Fallback to in-memory storage
         log_id = len(logs_memory) + 1
         log = {
             "id": log_id,
             "timestamp": datetime.utcnow(),
             "storage": "memory",
-            "anonymous": True,  # Mark as anonymous submission
+            "anonymous": True,
             **data
         }
         logs_memory.append(log)
-        print(f"✅ Anonymous network log submitted: {log_id}")
+        print(f"✅ Anonymous network log submitted to memory: {log_id}")
         return log
+        
     except Exception as e:
         print(f"Network log error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to submit network log: {str(e)}")
