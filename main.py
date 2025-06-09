@@ -692,6 +692,9 @@ async def submit_feedback(request: Request):
                     "latency": data.get("latency", 999),
                 }
                 
+                # Print detailed debug info
+                print(f"📝 Attempting to save feedback with data: {feedback_data}")
+                
                 # Create feedback in database (without user_id for anonymous)
                 db_feedback = Feedback(
                     user_id=1,  # Use anonymous user ID
@@ -700,9 +703,10 @@ async def submit_feedback(request: Request):
                 db.add(db_feedback)
                 db.commit()
                 db.refresh(db_feedback)
-                db.close()
                 
                 print(f"✅ Feedback saved to database: {db_feedback.id}")
+                
+                db.close()
                 return {
                     "id": db_feedback.id,
                     "timestamp": db_feedback.timestamp,
@@ -711,7 +715,8 @@ async def submit_feedback(request: Request):
                 }
                 
             except Exception as db_error:
-                print(f"Database error, falling back to memory: {db_error}")
+                print(f"❌ Database error saving feedback: {db_error}")
+                print(f"❌ Feedback data that failed: {data}")
                 # Fall through to memory storage
         
         # Fallback to in-memory storage
